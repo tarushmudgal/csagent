@@ -1,27 +1,25 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel, Field
-from typing import List
-from datetime import datetime
-from pymongo import MongoClient
+from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 from pydantic_ai import Agent, RunContext
+from typing import List
+from datetime import datetime
 from dataclasses import dataclass
-import json
+import os
 from dotenv import load_dotenv
 
 load_dotenv()  # Load environment variables from .env file
-import os
-from motor.motor_asyncio import AsyncIOMotorClient
 
-# MongoDB connection setup (using Motor for async support)
-MONGODB_URI = os.getenv("MONGODB_URI")  # Use environment variable for MongoDB URI
+# MongoDB connection setup
+MONGODB_URI = os.getenv("MONGODB_URI")
 if MONGODB_URI is None:
     raise ValueError("MONGODB_URI environment variable is not set")
 
 client = AsyncIOMotorClient(MONGODB_URI)
-db = client['hosting_company']
-customers_collection = db['customers']
-plans_collection = db['plans']
+db = client["hosting_company"]
+customers_collection = db["customers"]
+plans_collection = db["plans"]
 
 # FastAPI app setup
 app = FastAPI()
@@ -35,12 +33,11 @@ async def startup_db():
         print(f"MongoDB connection failed: {e}")
         raise HTTPException(status_code=500, detail="MongoDB connection failed")
 
-# Pydantic Model to validate incoming customer data
-class CustomerCreate(BaseModel):
-    name: str = Field(..., description="Name of the customer")
-    subscribed_plan: str = Field(..., description="Name of the plan the customer is subscribed to")
-    renewal_date: datetime = Field(..., description="Renewal date for the subscription")
-    average_usage: int = Field(..., description="Average usage by the customer", ge=0)
+# Define dependencies
+@dataclass
+class SupportDependencies:
+    customer_id: ObjectId
+    db: AsyncIOMotorClient
 
 # Define the structure of the result
 class SupportResult(BaseModel):
@@ -48,12 +45,6 @@ class SupportResult(BaseModel):
     block_card: bool = Field(description="Whether to block the customer's card")
     risk: int = Field(description="Risk level of query", ge=0, le=10)
     escalation_summary: str = Field(description="Summary for L2 escalation, if required", default="")
-
-# Define dependencies
-@dataclass
-class SupportDependencies:
-    customer_id: ObjectId
-    db: AsyncIOMotorClient
 
 # Create the support agent
 support_agent = Agent(
@@ -73,140 +64,127 @@ support_agent = Agent(
     ),
 )
 
-# Customer Creation Endpoint
-@app.post("/customers/create", response_model=CustomerCreate)
-async def create_customer(customer: CustomerCreate):
-    new_customer = customer.dict()
-    result = await customers_collection.insert_one(new_customer)
-    customer_data = await customers_collection.find_one({"_id": result.inserted_id})
-    return customer_data
-
+# Tool to fetch customer plan details
 @support_agent.tool
 async def customer_plan(ctx: RunContext[SupportDependencies]) -> dict:
-    customer_id = ctx.deps.customer_id
-    print(f"customer_id before any conversion: {customer_id}, Type: {type(customer_id)}")
-
-    if isinstance(customer_id, str):
-        try:
-            customer_id = ObjectId(customer_id)
-        except Exception as e:
-            print(f"Error converting to ObjectId: {e}") # Log conversion errors!
-            return {"error": f"Invalid ObjectId format: {e}"}
-
-    print(f"customer_id AFTER conversion attempt: {customer_id}, Type: {type(customer_id)}") # CRUCIAL CHECK
-    print(f"Querying customer with ID: {customer_id}")
-
+    """Fetches the customer's current subscribed plan and its details."""
     try:
-        customer = await ctx.deps.db.customers_collection.find_one({"_id": customer_id})
-        print(f"Customer found: {customer}")  # Log the retrieved customer data
-        if customer is None:
-            print("No customer found with the provided ID.")  # Log if no customer is found
+        customer = await ctx.deps.db.customers_collection.find_one({"_id": ctx.deps.customer_id})
+        if customer:
             return {
-                "support_advice": "I was unable to find your account. Please check your customer ID and try again.",
-                "block_card": False,
-                "risk": 0,
-                "escalation_summary": ""
+                "plan": customer["subscribed_plan"],
+                "renewal_date": customer["renewal_date"],
+                "average_usage": customer["average_usage"],
             }
-        else:
-            # Check if the customer's plan is active
-            if customer['subscribed_plan'] == "Basic Hosting" and customer['average_usage'] > 70:
-                return {
-                    "support_advice": "Your plan is active, but you are exceeding your average usage. Consider upgrading your plan.",
-                    "block_card": False,
-                    "risk": 5,
-                    "escalation_summary": ""
-                }
-            elif customer['renewal_date'] < datetime.now():
-                return {
-                    "support_advice": "Your renewal date has passed. Please renew your plan to avoid service interruption.",
-                    "block_card": False,
-                    "risk": 9,
-                    "escalation_summary": "Customer's renewal date is past due."
-                }
-            else:
-                return {
-                    "support_advice": "Your plan is active. If you have any issues, please contact support.",
-                    "block_card": False,
-                    "risk": 0,
-                    "escalation_summary": ""
-                }
+        return {"error": "Customer not found"}
     except Exception as e:
-        print(f"Database query error: {e}")
         return {"error": f"Database query error: {e}"}
 
+# Tool to list available plans
 @support_agent.tool
 async def list_available_plans(ctx: RunContext[SupportDependencies]) -> List[dict]:
+    """Returns a list of available plans and their descriptions."""
+    print("hello")
     plans = await ctx.deps.db.plans_collection.find().to_list(length=10)
+    print(plans)
     return [{"name": plan["name"], "description": plan["description"], "cost": plan["cost"]} for plan in plans]
 
+# Tool to escalate issues to Level 2
 @support_agent.tool
 async def escalate_to_l2(ctx: RunContext[SupportDependencies], issue_summary: str) -> str:
-    customer = await ctx.deps.db.customers_collection.find_one({"_id": ObjectId(ctx.deps.customer_id)})
-    if customer:
-        await ctx.deps.db.customers_collection.update_one(
-            {"_id": ObjectId(ctx.deps.customer_id)},
-            {"$set": {"escalation_log": issue_summary}}
-        )
-        return (
-            f"Escalation Summary:\nCustomer: {customer['name']}\nPlan: {customer['subscribed_plan']}\n"
-            f"Issue: {issue_summary}"
-        )
-    return "Escalation failed: Customer not found."
-
-def str_to_objectid(v: str) -> ObjectId:
+    """Escalates the issue to Level 2 support with a summary."""
     try:
-        return ObjectId(v)
+        customer = await ctx.deps.db.customers_collection.find_one({"_id": ctx.deps.customer_id})
+        if customer:
+            await ctx.deps.db.customers_collection.update_one(
+                {"_id": ctx.deps.customer_id},
+                {"$set": {"escalation_log": issue_summary}}
+            )
+            return (
+                f"Escalation Summary:\nCustomer: {customer['name']}\nPlan: {customer['subscribed_plan']}\n"
+                f"Issue: {issue_summary}"
+            )
+        return "Escalation failed: Customer not found."
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid ObjectId format: {e}")
+        return f"Escalation error: {e}"
 
+# Helper function to validate and convert customer ID
+def str_to_objectid(customer_id: str) -> ObjectId:
+    try:
+        return ObjectId(customer_id)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid customer ID format: {e}")
+
+# Pydantic model for support query
 class SupportQuery(BaseModel):
-    customer_id: str = Field(..., alias="customer_id", description="MongoDB ObjectId as string")
+    customer_id: str = Field(..., description="MongoDB ObjectId as string")
     query: str
 
     @classmethod
-    def parse_obj(cls, obj: dict) -> "SupportQuery":
-        try:
-            obj["customer_id"] = str_to_objectid(obj["customer_id"])
-            return super().parse_obj(obj)
-        except HTTPException as e:
-            raise e  # Re-raise the HTTPException
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Invalid payload: {e}")
+    def validate_customer_id(cls, customer_id: str) -> ObjectId:
+        return str_to_objectid(customer_id)
 
 @app.post("/support")
 async def support_query(payload: SupportQuery):
     try:
-        print(f"Received payload: {payload}")  # Log the received payload
-        deps = SupportDependencies(customer_id=payload.customer_id, db=db)
-        print(f"Running agent with customer ID: {payload.customer_id} and query: {payload.query}")  # Log the customer ID and query
+        customer_id = str_to_objectid(payload.customer_id)
+        deps = SupportDependencies(customer_id=customer_id, db=db)
         result = await support_agent.run(payload.query, deps=deps)
 
-        print(f"Response from agent: {result}")
-
-        if hasattr(result, 'data') and isinstance(result.data, SupportResult):
-            result_data = result.data
+        if hasattr(result, "data") and isinstance(result.data, SupportResult):
             return {
-                "support_advice": result_data.support_advice,
-                "block_card": result_data.block_card,
-                "risk": result_data.risk,
-                "escalation_summary": result_data.escalation_summary
+                "support_advice": result.data.support_advice,
+                "block_card": result.data.block_card,
+                "risk": result.data.risk,
+                "escalation_summary": result.data.escalation_summary,
             }
         else:
             raise HTTPException(status_code=500, detail=f"Unexpected response from agent: {result}")
+    except HTTPException as e:
+        raise e
     except Exception as e:
-        print(f"Error in support_query: {e}")
         raise HTTPException(status_code=500, detail=f"Error processing support query: {e}")
-    
-@app.get("/test_lookup/{customer_id}")
-async def test_lookup(customer_id: str):
-    try:
-        obj_id = ObjectId(customer_id)
-        customer = await customers_collection.find_one({"_id": obj_id})
-        return customer
-    except Exception as e:
-        return {"error": str(e)}
 
-if __name__ == "__main__":
+from fastapi.encoders import jsonable_encoder
+from bson import ObjectId
+from typing import List
+
+# Helper function to convert ObjectId to string
+# For Fetching plans from db
+def convert_objectid(obj):
+    if isinstance(obj, ObjectId):
+        return str(obj)
+    if isinstance(obj, dict):
+        return {key: convert_objectid(value) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [convert_objectid(item) for item in obj]
+    return obj
+
+@app.get("/plans")
+async def get_plans():
+    try:
+        plans = await plans_collection.find().to_list(length=10)
+        # Convert any ObjectId fields to string
+        plans = convert_objectid(plans)
+        return jsonable_encoder(plans) 
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching plans: {e}")
+
+
+
+@app.get("/customer/{customer_id}")
+async def get_customer(customer_id: str):
+    try:
+        obj_id = str_to_objectid(customer_id)
+        customer = await customers_collection.find_one({"_id": obj_id})
+        if customer:
+            return customer
+        raise HTTPException(status_code=404, detail="Customer not found")
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching customer: {e}")
+
+if __name__ == "_main_":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
