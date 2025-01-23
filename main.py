@@ -150,7 +150,6 @@ from bson import ObjectId
 from typing import List
 
 # Helper function to convert ObjectId to string
-# For Fetching plans from db
 def convert_objectid(obj):
     if isinstance(obj, ObjectId):
         return str(obj)
@@ -166,24 +165,51 @@ async def get_plans():
         plans = await plans_collection.find().to_list(length=10)
         # Convert any ObjectId fields to string
         plans = convert_objectid(plans)
-        return jsonable_encoder(plans) 
+        return jsonable_encoder(plans)  # Now return the jsonable_encoder version
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching plans: {e}")
 
 
 
+from fastapi.encoders import jsonable_encoder
+from bson import ObjectId
+from typing import Dict
+
+# Custom encoder to handle ObjectId conversion
+# Convert ObjectId to string before returning
+def convert_objectid_to_str(obj: Dict):
+    """
+    Convert ObjectId fields to string recursively in the dictionary.
+    """
+    if isinstance(obj, ObjectId):
+        return str(obj)
+    elif isinstance(obj, dict):
+        return {key: convert_objectid_to_str(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_objectid_to_str(item) for item in obj]
+    return obj
+
 @app.get("/customer/{customer_id}")
 async def get_customer(customer_id: str):
     try:
+        # Convert customer_id from string to ObjectId
         obj_id = str_to_objectid(customer_id)
+        
+        # Fetch customer from the database
         customer = await customers_collection.find_one({"_id": obj_id})
+        
         if customer:
+            # Convert the customer data to JSON-safe format (convert ObjectId to string)
+            customer = convert_objectid_to_str(customer)
             return customer
-        raise HTTPException(status_code=404, detail="Customer not found")
-    except HTTPException as e:
-        raise e
+        else:
+            raise HTTPException(status_code=404, detail="Customer not found")
+    
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching customer: {e}")
+
+
+
 
 if __name__ == "_main_":
     import uvicorn
